@@ -9,6 +9,9 @@ grounding, and flags them as VERIFIED, INACCURATE, or FALSE — with the correct
 
 import json
 import os
+import random
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -20,9 +23,37 @@ from google.genai import types
 # ----------------------------------------------------------------------------- #
 # Config
 # ----------------------------------------------------------------------------- #
-MODEL = "gemini-2.5-flash"
-MAX_CLAIMS = 15   # cap to protect free-tier API credits
-MAX_WORKERS = 4  # parallel claim verification
+MODEL = "gemini-2.5-flash-lite"  # higher free-tier RPM than full flash
+MAX_CLAIMS = 10   # cap to protect free-tier API credits
+MAX_WORKERS = 3   # parallel claim verification (gated by the rate limiter below)
+RPM = 14          # keep total requests/min under the free-tier quota
+MAX_RETRIES = 5   # retry on 429 RESOURCE_EXHAUSTED with backoff
+
+# global pacer: serializes + spaces calls across all worker threads so we never
+# exceed the free-tier per-minute quota (the cause of "Unverified" 429 errors).
+_pace_lock = threading.Lock()
+_last_call = [0.0]
+
+
+def paced_generate(client, contents, config):
+    """Rate-limited generate_content with retry/backoff on 429."""
+    interval = 60.0 / RPM
+    for attempt in range(MAX_RETRIES):
+        with _pace_lock:
+            wait = _last_call[0] + interval - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            _last_call[0] = time.monotonic()
+        try:
+            return client.models.generate_content(
+                model=MODEL, contents=contents, config=config
+            )
+        except Exception as e:
+            transient = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+            if transient and attempt < MAX_RETRIES - 1:
+                time.sleep(min(20, 2 ** attempt + random.random()))
+                continue
+            raise
 
 VERDICT_STYLE = {
     "VERIFIED":   {"emoji": "✅", "color": "#1a7f37", "bg": "#e6f4ea"},
@@ -84,10 +115,10 @@ DOCUMENT TEXT:
 
 def extract_claims(client: genai.Client, doc_text: str) -> list[str]:
     prompt = EXTRACT_PROMPT.format(max_claims=MAX_CLAIMS, doc=doc_text[:20000])
-    resp = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
+    resp = paced_generate(
+        client,
+        prompt,
+        types.GenerateContentConfig(
             response_mime_type="application/json",
             temperature=0,
         ),
@@ -122,10 +153,10 @@ EXPLANATION: <one sentence on why>
 
 
 def verify_claim(client: genai.Client, claim: str) -> dict:
-    resp = client.models.generate_content(
-        model=MODEL,
-        contents=VERIFY_PROMPT.format(claim=claim),
-        config=types.GenerateContentConfig(
+    resp = paced_generate(
+        client,
+        VERIFY_PROMPT.format(claim=claim),
+        types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
             temperature=0,
         ),
@@ -261,9 +292,14 @@ def main():
             try:
                 results.append(fut.result())
             except Exception as e:  # keep going if one claim fails
+                msg = str(e)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    note = "Gemini free-tier rate limit reached — wait a minute and re-run."
+                else:
+                    note = f"Verification error: {msg[:160]}"
                 results.append({"claim": futures[fut], "verdict": "UNVERIFIED",
                                 "confidence": None, "correct_fact": "",
-                                "explanation": f"Verification error: {e}", "sources": []})
+                                "explanation": note, "sources": []})
             done += 1
             progress.progress(done / len(claims))
     progress.empty()
